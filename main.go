@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -13,18 +14,20 @@ import (
 )
 
 const (
-	clientMsg      = "ping"
-	serverMsg      = "pong"
-	curRow         = 2
-	upperLimitRow  = 1
-	buttonLimitRow = 0
-	rows           = 3
-	interval       = time.Second / 8
-	upperLimit     = 30 * time.Millisecond
-	buttonLimit    = 0
+	clientMsg        = "ping"
+	serverMsg        = "pong"
+	curRow           = 2
+	upperLimitRow    = 1
+	buttonLimitRow   = 0
+	rows             = 3
+	interval         = time.Second / 8
+	upperLimit       = 300 * time.Millisecond
+	buttonLimit      = 130 * time.Millisecond
+	maxLineLenBytes  = 1024
+	readWriteTimeout = time.Minute
 )
 
-//ref madflojo.medium.com/keeping-tcp-connections-alive-in-golang-801a78b7cf1
+// ref madflojo.medium.com/keeping-tcp-connections-alive-in-golang-801a78b7cf1
 func server(addr *net.TCPAddr) error {
 
 	// Start TCP Listener
@@ -33,38 +36,63 @@ func server(addr *net.TCPAddr) error {
 		return fmt.Errorf("Unable to start listener: %v", err)
 	}
 
-	for true {
+	for {
 		// Wait for new connections and send them to reader()
 		c, err := l.AcceptTCP()
 		if err != nil {
 			return fmt.Errorf("Listener returned: %v", err)
 		}
 
-		// Enable Keepalives
 		err = c.SetKeepAlive(false)
 		if err != nil {
 			return fmt.Errorf("Unable to set keepalive: %v", err)
 		}
-		go func() {
-			for true {
-				msg, err := bufio.NewReader(c).ReadString('\n')
-				if err != nil {
-					panic(fmt.Sprintf("Unable to read from client: %v", err))
-				}
-				msg = strings.TrimSuffix(msg, "\n")
-				if msg != clientMsg {
-					panic(fmt.Sprintf("Received unexpected server message: %s", msg))
-				}
-				log.Println("received: " + msg)
-				log.Println("send: " + serverMsg)
-				_, err = fmt.Fprintf(c, fmt.Sprintf("%s\n", serverMsg))
-				if err != nil {
-					panic(fmt.Sprintf("Unable to send msg: %v", err))
-				}
-			}
-		}()
+		go serveConnection(c)
 	}
 	return nil
+}
+
+func serveConnection(conn net.Conn) {
+	log.Printf("accepted connection from %s", conn.RemoteAddr())
+
+	defer func() {
+		_ = conn.Close()
+		log.Printf("closed connection from %s", conn.RemoteAddr())
+	}()
+	done := make(chan struct{})
+
+	// time out one minute from now if no
+	// data is received
+	_ = conn.SetReadDeadline(time.Now().Add(readWriteTimeout))
+
+	go func() {
+		// limit the maximum line length (in bytes)
+		lim := &io.LimitedReader{
+			R: conn,
+			N: maxLineLenBytes,
+		}
+		scan := bufio.NewScanner(lim)
+		for scan.Scan() {
+			input := scan.Text()
+			output := ""
+			if input == clientMsg {
+				output = serverMsg
+			}
+			if _, err := conn.Write([]byte(output + "\n")); err != nil {
+				log.Printf("failed to write output: %v", err)
+				return
+			}
+			log.Printf("wrote response: %s", output)
+			// reset the number of bytes remaining in the LimitReader
+			lim.N = maxLineLenBytes
+			// reset the read deadline
+			_ = conn.SetReadDeadline(time.Now().Add(readWriteTimeout))
+		}
+
+		done <- struct{}{}
+	}()
+
+	<-done
 }
 
 func client(addr *net.TCPAddr) error {
